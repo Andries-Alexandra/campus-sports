@@ -1,0 +1,1054 @@
+openapi: 3.0.3
+info:
+  title: Campus Sports Booking REST API
+  description: >
+    API-ul oficial pentru platforma universitară **Campus Sports Booking** (Echipa 3BITS).
+    Permite autentificarea utilizatorilor, explorarea facilităților sportive, calculul automat al tarifelor
+    pentru Studenți, Profesori și Amatori, rezervarea terenurilor sau a locurilor (bazin, saună, fitness),
+    plata online, validarea biletelor electronice prin coduri QR și remindere.
+
+
+    **Flux rezervare:** `POST /bookings` (status `INITIATED`, slot blocat 5 minute, fără cod QR) →
+    `POST /bookings/{id}/pay` (`PENDING_PAYMENT`) → webhook-ul procesatorului (`CONFIRMED`, abia acum există codul QR)
+    → scanare la recepție (`CHECKED_IN`) → `COMPLETED`. Rezervările neplătite în 5 minute devin `CANCELLED`;
+    cele confirmate dar nefolosite devin `EXPIRED`.
+
+
+    **Erori:** toate răspunsurile de eroare au forma `{ "error": { "code", "message" } }`. Codurile `SB400`, `SB403`,
+    `SB404`, `SB409` vin direct din funcțiile bazei de date; `OVERLAP` înseamnă suprapunere (23P01).
+  version: 1.1.0
+  contact:
+    name: Echipa 3BITS (Flocea Cosmin, Andrieș Alexandra, Strugar Sebastian)
+    email: contact@3bits-campussports.ro
+servers:
+  - url: https://api.campussports.univ.ro/api/v1
+    description: Server Producție Campus
+  - url: http://localhost:5000/api/v1
+    description: Server Dezvoltare Locală (Node.js / Express)
+
+security:
+  - bearerAuth: []
+
+tags:
+  - name: Autentificare & Profil
+    description: Înregistrare, autentificare, profil și setări utilizator
+  - name: Facilități Sportive & Hartă
+    description: Explorarea terenurilor, bazinelor, saunelor și sălilor din campus
+  - name: Rezervări & Orar
+    description: Crearea, vizualizarea și anularea rezervărilor
+  - name: Tarife & Calcul Reduceri
+    description: Algoritm de calcul tarif (Student, Profesor, Amator, rezervare din timp)
+  - name: Coduri QR & Recepție
+    description: Scanarea și validarea accesului fizic la baza sportivă (doar RECEPTIONIST / ADMIN)
+  - name: Plăți Online
+    description: Inițierea plății și confirmarea de la procesatorul extern
+
+paths:
+  # ==========================================
+  # 1. AUTENTIFICARE & PROFIL
+  # ==========================================
+  /auth/login:
+    post:
+      tags: [Autentificare & Profil]
+      operationId: login
+      summary: Autentificare utilizator
+      description: Verifică credențialele (bcrypt) și returnează un JWT token.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [email, password]
+              properties:
+                email:
+                  type: string
+                  format: email
+                  example: cosmin.flocea@student.ro
+                password:
+                  type: string
+                  format: password
+                  example: ParolaStudent2026!
+      responses:
+        '200':
+          description: Autentificare reușită
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  token:
+                    type: string
+                  user:
+                    $ref: '#/components/schemas/User'
+        '401':
+          description: Credențiale invalide
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /auth/register:
+    post:
+      tags: [Autentificare & Profil]
+      operationId: register
+      summary: Înregistrare utilizator nou
+      description: >
+        Creează un cont public (Student, Profesor sau Amator) și profilul asociat.
+        Obligatorii sunt doar numele, emailul și parola; datele din profil sunt opționale.
+        Conturile `RECEPTIONIST` și `ADMIN` se creează doar de administrator.
+      security: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [fullName, email, password]
+              properties:
+                fullName:
+                  type: string
+                  example: Ana Popescu
+                email:
+                  type: string
+                  format: email
+                  example: ana.popescu@stud.univ.ro
+                phone:
+                  type: string
+                  nullable: true
+                  example: "0721000000"
+                password:
+                  type: string
+                  format: password
+                  minLength: 8
+                roleType:
+                  type: string
+                  enum: [STUDENT, PROFESSOR, AMATEUR]
+                  default: STUDENT
+                matricolNumber:
+                  type: string
+                  nullable: true
+                  example: "3BITS-001"
+                faculty:
+                  type: string
+                  nullable: true
+                studyYear:
+                  type: integer
+                  minimum: 1
+                  maximum: 6
+                  nullable: true
+                department:
+                  type: string
+                  nullable: true
+                academicTitle:
+                  type: string
+                  nullable: true
+                organization:
+                  type: string
+                  nullable: true
+      responses:
+        '201':
+          description: Cont creat cu succes
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Date de intrare invalide (parolă < 8 caractere, email invalid, rol nepermis)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Email sau număr matricol deja existent
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /users/me:
+    get:
+      tags: [Autentificare & Profil]
+      operationId: getMyProfile
+      summary: Profilul și setările utilizatorului logat ("Contul meu")
+      responses:
+        '200':
+          description: Profil și setări
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+    patch:
+      tags: [Autentificare & Profil]
+      operationId: updateMySettings
+      summary: Modificare setări (limbă, monedă, mod întunecat, reminder)
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserSettings'
+      responses:
+        '200':
+          description: Setări salvate
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/User'
+        '400':
+          description: Valoare nepermisă (ex. limbă diferită de ro / en)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==========================================
+  # 2. FACILITĂȚI SPORTIVE
+  # ==========================================
+  /facilities:
+    get:
+      tags: [Facilități Sportive & Hartă]
+      operationId: listFacilities
+      summary: Listare facilități sportive
+      description: Lista facilităților din campus, cu filtrare după sport sau categorie (chip-urile din aplicație).
+      parameters:
+        - name: sportType
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [Fotbal, Tenis, Natație, Fitness, Saună]
+        - name: category
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [Sporturi, Înot, Relaxare]
+        - name: q
+          in: query
+          required: false
+          description: Căutare după nume
+          schema:
+            type: string
+      responses:
+        '200':
+          description: Listă facilități găsită
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/SportFacility'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /facilities/{id}/availability:
+    get:
+      tags: [Facilități Sportive & Hartă]
+      operationId: getAvailability
+      summary: Intervale orare disponibile
+      description: >
+        Sloturile zilei pentru o facilitate. Pentru facilitățile pe locuri (bazin, saună, fitness)
+        `seatsLeft` arată locurile rămase din `capacity`. Dacă facilitatea este închisă în ziua aleasă,
+        `slots` este o listă goală. `overlapsOwnBooking` este adevărat când slotul se suprapune cu o
+        rezervare activă a utilizatorului logat (slot dezactivat în aplicație).
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+          example: 3
+        - name: date
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+          example: "2026-11-03"
+      responses:
+        '200':
+          description: Orarul zilei
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  facilityId:
+                    type: integer
+                  date:
+                    type: string
+                    format: date
+                  slotMinutes:
+                    type: integer
+                    example: 60
+                  slots:
+                    type: array
+                    items:
+                      $ref: '#/components/schemas/Slot'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Facilitate inexistentă sau inactivă
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /equipment:
+    get:
+      tags: [Facilități Sportive & Hartă]
+      operationId: listEquipment
+      summary: Echipamente închiriabile
+      description: Echipamentele opționale afișate pe ecranul de detalii (ex. ochelari de înot 4 RON).
+      parameters:
+        - name: sportCategory
+          in: query
+          required: false
+          schema:
+            type: string
+            enum: [Fotbal, Tenis, Natație]
+      responses:
+        '200':
+          description: Lista echipamentelor
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Equipment'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  # ==========================================
+  # 3. TARIFE
+  # ==========================================
+  /tariffs/calculate:
+    get:
+      tags: [Tarife & Calcul Reduceri]
+      operationId: calculatePrice
+      summary: Calcul preț detaliat (rezumatul de dinainte de plată)
+      description: >
+        Aplică tariful rolului utilizatorului logat (Student -50%, Profesor -30%, Amator standard)
+        și, unde există, reducerea pentru rezervare din timp. Nu creează nicio rezervare.
+      parameters:
+        - name: facilityId
+          in: query
+          required: true
+          schema:
+            type: integer
+        - name: bookingDate
+          in: query
+          required: true
+          schema:
+            type: string
+            format: date
+        - name: startTime
+          in: query
+          required: true
+          schema:
+            type: string
+            example: "10:00:00"
+        - name: endTime
+          in: query
+          required: true
+          schema:
+            type: string
+            example: "11:00:00"
+        - name: seats
+          in: query
+          required: false
+          schema:
+            type: integer
+            minimum: 1
+            default: 1
+      responses:
+        '200':
+          description: Detalierea prețului
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PriceBreakdown'
+        '400':
+          description: Parametri invalizi
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Facilitate inexistentă
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ==========================================
+  # 4. REZERVĂRI
+  # ==========================================
+  /bookings:
+    post:
+      tags: [Rezervări & Orar]
+      operationId: createBooking
+      summary: Creare rezervare nouă
+      description: >
+        Verifică programul, grila de sloturi, suprapunerile (teren) sau locurile libere (bazin, saună, fitness),
+        calculează tariful și blochează slotul **5 minute** (`holdExpiresAt`). Rezervarea este `INITIATED`;
+        **codul QR nu există încă** - se generează abia după plată. Rezervările gratuite se confirmă prin
+        `POST /bookings/{id}/pay`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [facilityId, bookingDate, startTime, endTime]
+              properties:
+                facilityId:
+                  type: integer
+                  example: 3
+                bookingDate:
+                  type: string
+                  format: date
+                  example: "2026-11-03"
+                startTime:
+                  type: string
+                  example: "10:00:00"
+                endTime:
+                  type: string
+                  example: "11:00:00"
+                seats:
+                  type: integer
+                  minimum: 1
+                  default: 1
+                  description: Număr de locuri (doar facilități pe locuri); la terenuri se ignoră.
+                reminderEnabled:
+                  type: boolean
+                  default: true
+                equipment:
+                  type: array
+                  items:
+                    $ref: '#/components/schemas/EquipmentRequest'
+      responses:
+        '201':
+          description: Rezervare creată (status INITIATED, fără cod QR)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: Regulă încălcată - în trecut, în afara programului, slot nealiniat, facilitate închisă în acea zi (SB400)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Rolul utilizatorului nu are drept de rezervare (SB403)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Facilitate sau echipament inexistent (SB404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Slot ocupat, locuri insuficiente, stoc insuficient sau suprapunere cu altă rezervare a ta (SB409 / OVERLAP)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings/my-bookings:
+    get:
+      tags: [Rezervări & Orar]
+      operationId: listMyBookings
+      summary: Rezervările utilizatorului logat
+      parameters:
+        - name: scope
+          in: query
+          required: false
+          description: "`upcoming` = tab Viitoare, `history` = tab Istoric; fără parametru: toate"
+          schema:
+            type: string
+            enum: [upcoming, history]
+      responses:
+        '200':
+          description: Lista rezervărilor
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+
+  /bookings/{id}:
+    get:
+      tags: [Rezervări & Orar]
+      operationId: getBooking
+      summary: Detaliile unei rezervări (ecranul "Rezervare confirmată")
+      description: Include `qrCodePayload` doar după confirmare și cât timp rezervarea nu este anulată.
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Rezervarea
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Rezervare inexistentă sau a altui utilizator
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings/{id}/pay:
+    post:
+      tags: [Plăți Online]
+      operationId: payBooking
+      summary: Inițiere plată ("Confirmă și plătește")
+      description: >
+        Dacă totalul este mai mare ca 0, creează tranzacția `PENDING` la procesator și trece rezervarea în
+        `PENDING_PAYMENT`; confirmarea vine prin `POST /payments/webhook`. Poate fi apelat din nou după o plată
+        eșuată ("Reîncearcă plata") cât timp nu au trecut cele 5 minute. Dacă totalul este 0 (acces gratuit),
+        rezervarea se confirmă imediat și se generează codul QR.
+        Pe serverul de dezvoltare, câmpul `simulateResult` simulează răspunsul procesatorului (MVP demonstrativ).
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      requestBody:
+        required: false
+        content:
+          application/json:
+            schema:
+              type: object
+              properties:
+                method:
+                  type: string
+                  default: CARD_ONLINE
+                simulateResult:
+                  type: string
+                  enum: [SUCCESS, FAILED]
+                  description: Doar în Server Dezvoltare Locală
+      responses:
+        '200':
+          description: Sesiune de plată creată sau rezervare gratuită confirmată
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/PaymentSession'
+        '400':
+          description: Au trecut cele 5 minute de blocare (SB400)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '404':
+          description: Rezervare inexistentă
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Rezervarea nu mai așteaptă plata (SB409)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  /bookings/{id}/cancel:
+    post:
+      tags: [Rezervări & Orar]
+      operationId: cancelBooking
+      summary: Anulare rezervare
+      description: >
+        O rezervare confirmată se poate anula gratuit cu minimum 24 de ore înainte de start. Rezervările
+        neplătite (INITIATED / PENDING_PAYMENT) se pot anula oricând. Slotul se eliberează, codul QR se
+        invalidează, echipamentul revine în stoc, iar plata reușită este marcată `REFUNDED`
+        (rambursarea efectivă o face procesatorul).
+      parameters:
+        - $ref: '#/components/parameters/BookingId'
+      responses:
+        '200':
+          description: Rezervare anulată, slot eliberat
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Booking'
+        '400':
+          description: Mai puțin de 24h până la start sau status care nu mai permite anularea (SB400)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Rezervarea aparține altui utilizator (SB403)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Rezervare inexistentă
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ==========================================
+  # 5. PLĂȚI - WEBHOOK
+  # ==========================================
+  /payments/webhook:
+    post:
+      tags: [Plăți Online]
+      operationId: paymentWebhook
+      summary: Notificare de la procesatorul de plăți (Stripe)
+      description: >
+        Apelat de procesator, nu de aplicația mobilă. Verifică semnătura (`Stripe-Signature`) și apelează
+        `complete_payment`. Este idempotent: aceeași notificare primită de două ori nu produce erori.
+        Dacă rezervarea a fost deja anulată sau a expirat (409), backend-ul rambursează tranzacția.
+      security: []
+      parameters:
+        - name: Stripe-Signature
+          in: header
+          required: true
+          schema:
+            type: string
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [type, data]
+              properties:
+                type:
+                  type: string
+                  enum: [payment_intent.succeeded, payment_intent.payment_failed]
+                data:
+                  type: object
+                  properties:
+                    object:
+                      type: object
+                      properties:
+                        id:
+                          type: string
+                          example: pi_3Q1abc
+      responses:
+        '200':
+          description: Notificare procesată
+        '400':
+          description: Semnătură invalidă
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Tranzacție necunoscută (SB404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '409':
+          description: Rezervarea nu mai așteaptă plata; tranzacția trebuie rambursată (SB409)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+  # ==========================================
+  # 6. CODURI QR & ACCES RECEPȚIE
+  # ==========================================
+  /qr/validate:
+    post:
+      tags: [Coduri QR & Recepție]
+      operationId: validateQr
+      summary: Scanare și validare cod QR la recepție
+      description: >
+        Permis doar utilizatorilor cu rol `RECEPTIONIST` sau `ADMIN`. Accesul este valid de la 15 minute
+        înainte de start până la sfârșitul intervalului; rezervarea trece în `CHECKED_IN`.
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              type: object
+              required: [qrToken]
+              properties:
+                qrToken:
+                  type: string
+                  example: "CSB-3-0b9f3c0e-6b1c-4d57-9d76-1c2f1e3a8a11"
+      responses:
+        '200':
+          description: Acces permis (QR valid)
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  accessGranted:
+                    type: boolean
+                    example: true
+                  bookingId:
+                    type: integer
+                    example: 3
+                  userName:
+                    type: string
+                    example: Alexandra Andrieș
+                  roleType:
+                    type: string
+                    example: STUDENT
+                  facilityName:
+                    type: string
+                    example: Bazin
+                  seats:
+                    type: integer
+                    example: 2
+                  interval:
+                    type: string
+                    example: "10:00 - 11:00"
+        '401':
+          $ref: '#/components/responses/Unauthorized'
+        '403':
+          description: Utilizatorul nu este recepționer, cod deja scanat, rezervare anulată sau interval expirat (SB403)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+        '404':
+          description: Cod QR necunoscut (SB404)
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/Error'
+
+components:
+  securitySchemes:
+    bearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: Tokenul primit la `POST /auth/login`, trimis ca `Authorization Bearer <token>`.
+
+  parameters:
+    BookingId:
+      name: id
+      in: path
+      required: true
+      schema:
+        type: integer
+      example: 3
+
+  responses:
+    Unauthorized:
+      description: Token lipsă, invalid sau expirat
+      content:
+        application/json:
+          schema:
+            $ref: '#/components/schemas/Error'
+
+  schemas:
+    Error:
+      type: object
+      properties:
+        error:
+          type: object
+          properties:
+            code:
+              type: string
+              enum: [SB400, SB403, SB404, SB409, OVERLAP, UNAUTHORIZED, VALIDATION]
+              example: SB409
+            message:
+              type: string
+              example: "Locuri insuficiente: libere 4, cerute 6"
+
+    UserSettings:
+      type: object
+      properties:
+        preferredLanguage:
+          type: string
+          enum: [ro, en]
+          example: ro
+        preferredCurrency:
+          type: string
+          enum: [RON, EUR]
+          example: RON
+        darkMode:
+          type: boolean
+          example: false
+        reminderMinutesBefore:
+          type: integer
+          minimum: 15
+          maximum: 180
+          nullable: true
+          description: Cu cât timp înainte se trimite reminderul; null = dezactivat.
+          example: 60
+
+    User:
+      type: object
+      properties:
+        userId:
+          type: integer
+        fullName:
+          type: string
+        email:
+          type: string
+        phone:
+          type: string
+          nullable: true
+        roleType:
+          type: string
+          enum: [STUDENT, PROFESSOR, AMATEUR, RECEPTIONIST, ADMIN]
+        settings:
+          $ref: '#/components/schemas/UserSettings'
+
+    SportFacility:
+      type: object
+      properties:
+        facilityId:
+          type: integer
+        name:
+          type: string
+          example: Bazin
+        sportType:
+          type: string
+          enum: [Fotbal, Tenis, Natație, Fitness, Saună]
+        category:
+          type: string
+          enum: [Sporturi, Înot, Relaxare]
+        bookingMode:
+          type: string
+          enum: [EXCLUSIVE, SHARED]
+          description: EXCLUSIVE = tot terenul; SHARED = rezervare pe locuri.
+        capacity:
+          type: integer
+          example: 10
+        slotMinutes:
+          type: integer
+          example: 60
+        basePricePerHour:
+          type: number
+          example: 25
+        pricePerSlot:
+          type: number
+          example: 25
+        pricePerSlotEur:
+          type: number
+          example: 5
+        hasLighting:
+          type: boolean
+        opensAt:
+          type: string
+          example: "08:00"
+        closesAt:
+          type: string
+          example: "21:00"
+        openDays:
+          type: array
+          description: Zile de funcționare, ISO (1 = luni ... 7 = duminică)
+          items:
+            type: integer
+          example: [1, 2, 3, 4, 5]
+        openToday:
+          type: boolean
+        hasEarlyDiscount:
+          type: boolean
+        earlyBookingDays:
+          type: integer
+          nullable: true
+          example: 3
+        earlyBookingDiscount:
+          type: number
+          nullable: true
+          example: 10
+        locationName:
+          type: string
+          example: Complex sportiv, corp A
+        address:
+          type: string
+        geoCoordinates:
+          type: string
+          example: "47.6540, 26.2580"
+        contactPhone:
+          type: string
+          nullable: true
+
+    Slot:
+      type: object
+      properties:
+        startTime:
+          type: string
+          format: date-time
+          example: "2026-11-03T10:00:00+02:00"
+        endTime:
+          type: string
+          format: date-time
+          example: "2026-11-03T11:00:00+02:00"
+        capacity:
+          type: integer
+          example: 10
+        seatsLeft:
+          type: integer
+          example: 6
+        isAvailable:
+          type: boolean
+          example: true
+        overlapsOwnBooking:
+          type: boolean
+          example: false
+
+    Equipment:
+      type: object
+      properties:
+        equipmentId:
+          type: integer
+        name:
+          type: string
+          example: Ochelari de înot
+        sportCategory:
+          type: string
+          example: Natație
+        availableStock:
+          type: integer
+        hourlyFee:
+          type: number
+          example: 4
+
+    EquipmentRequest:
+      type: object
+      required: [equipmentId, quantity]
+      properties:
+        equipmentId:
+          type: integer
+          example: 3
+        quantity:
+          type: integer
+          minimum: 1
+          example: 2
+
+    PriceBreakdown:
+      type: object
+      properties:
+        baseAmount:
+          type: number
+          example: 25
+        discountAmount:
+          type: number
+          example: 12.5
+        totalAmount:
+          type: number
+          example: 12.5
+        totalAmountEur:
+          type: number
+          example: 2.5
+        roleDiscountPercent:
+          type: number
+          example: 50
+        earlyDiscountPercent:
+          type: number
+          example: 0
+
+    Booking:
+      type: object
+      properties:
+        bookingId:
+          type: integer
+        bookingCode:
+          type: string
+          example: SC-031126-003
+        facilityId:
+          type: integer
+        facilityName:
+          type: string
+        sportType:
+          type: string
+        locationName:
+          type: string
+        bookingDate:
+          type: string
+          format: date
+        startTime:
+          type: string
+          format: date-time
+        endTime:
+          type: string
+          format: date-time
+        seats:
+          type: integer
+        baseAmount:
+          type: number
+        discountAmount:
+          type: number
+        equipmentAmount:
+          type: number
+        totalAmount:
+          type: number
+        totalAmountEur:
+          type: number
+        status:
+          type: string
+          enum: [INITIATED, PENDING_PAYMENT, CONFIRMED, CHECKED_IN, COMPLETED, CANCELLED, EXPIRED]
+        holdExpiresAt:
+          type: string
+          format: date-time
+          nullable: true
+          description: Doar pentru INITIATED / PENDING_PAYMENT (blocare 5 minute).
+        reminderEnabled:
+          type: boolean
+        lastPaymentStatus:
+          type: string
+          nullable: true
+          description: "PENDING, SUCCESS, FAILED sau REFUNDED; null dacă nu s-a încercat nicio plată."
+        isUpcoming:
+          type: boolean
+        qrCodePayload:
+          type: string
+          nullable: true
+          description: Null până la confirmarea plății și după anulare.
+        equipment:
+          type: array
+          items:
+            $ref: '#/components/schemas/EquipmentRequest'
+
+    PaymentSession:
+      type: object
+      properties:
+        bookingId:
+          type: integer
+        paymentRequired:
+          type: boolean
+          description: False pentru rezervări gratuite, confirmate imediat.
+        transactionRef:
+          type: string
+          nullable: true
+          example: pi_3Q1abc
+        clientSecret:
+          type: string
+          nullable: true
+          description: Secretul PaymentIntent pentru formularul de card (Stripe).
+        amount:
+          type: number
+          example: 33
+        currency:
+          type: string
+          example: RON
+        booking:
+          $ref: '#/components/schemas/Booking'

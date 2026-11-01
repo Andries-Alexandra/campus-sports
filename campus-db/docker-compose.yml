@@ -1,0 +1,38 @@
+# Pornire baza de date locala pentru dezvoltare:   docker compose up -d
+# Reset complet (sterge datele si reia scriptul):   docker compose down -v && docker compose up -d
+# Scriptul SQL se executa AUTOMAT doar la prima pornire (cand volumul este gol).
+services:
+  db:
+    image: postgres:16
+    container_name: campus_sports_db
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: ${DB_NAME:-campus_sports}
+      POSTGRES_USER: ${DB_USER:-campus_admin}
+      POSTGRES_PASSWORD: ${DB_PASSWORD:?Creeaza fisierul .env (copie dupa .env.example) si seteaza DB_PASSWORD}
+      TZ: Europe/Bucharest
+      PGTZ: Europe/Bucharest
+    ports:
+      - "${DB_PORT:-5432}:5432"
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./schema_campus_sports_v2.sql:/docker-entrypoint-initdb.d/01_schema.sql:ro
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${DB_USER:-campus_admin} -d ${DB_NAME:-campus_sports}"]
+      interval: 5s
+      timeout: 3s
+      retries: 10
+
+  # Client web optional (alternativa la DBeaver/pgAdmin): http://localhost:8080
+  # Server = db | Utilizator/Parola/Baza din .env
+  adminer:
+    image: adminer:4
+    restart: unless-stopped
+    depends_on:
+      db:
+        condition: service_healthy
+    ports:
+      - "8080:8080"
+
+volumes:
+  pgdata:
